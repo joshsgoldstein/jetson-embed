@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1.7
+# Build jetson-embed with CUDA support for the AGX Orin (sm_87).
+# The JetPack 6 base has CUDA 12.6 + nvcc and runs unchanged on a JetPack 7.2 host.
+# Build ON the Jetson (aarch64): docker build -f Dockerfile.jetson -t jetson-embed:cuda .
+
+FROM nvcr.io/nvidia/l4t-jetpack:r36.4.0 AS build
+ENV DEBIAN_FRONTEND=noninteractive \
+    PATH=/root/.cargo/bin:/usr/local/cuda/bin:$PATH \
+    CUDA_COMPUTE_CAP=87
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl ca-certificates build-essential pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+WORKDIR /src
+# Dependency layer: build with an empty main so source edits do not rebuild candle.
+COPY Cargo.toml Cargo.lock* ./
+RUN mkdir -p src && echo 'fn main(){}' > src/main.rs \
+    && cargo build --release --features cuda 2>&1 | tail -3 \
+    && rm -rf src
+COPY src ./src
+RUN touch src/main.rs && cargo build --release --features cuda
+
+FROM nvcr.io/nvidia/l4t-jetpack:r36.4.0
+COPY --from=build /src/target/release/jetson-embed /usr/local/bin/jetson-embed
+ENV DTYPE=f16 MAX_BATCH_TOKENS=16384 PORT=8015 HOST=0.0.0.0
+EXPOSE 8015
+# MODEL_DIR must be mounted, e.g. -v /ssd/hf-cache/embed/bge-base:/model -e MODEL_DIR=/model
+ENTRYPOINT ["jetson-embed", "serve"]

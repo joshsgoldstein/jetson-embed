@@ -1,0 +1,8 @@
+/target
+/models
+*.safetensors
+/baseline/.venv
+/baseline/reference/*.json
+__pycache__/
+.env
+/references

@@ -1,0 +1,3 @@
+sentence-transformers>=3.0
+torch
+einops          # nomic-bert custom code imports it
