@@ -1,7 +1,8 @@
 //! OpenAI-compatible HTTP API on top of `Embedder`.
 //!
 //!   POST /v1/embeddings   {"input": "text" | ["..."], "model": "...",
-//!                          "dimensions": 256, "prefix": "search_query: "}
+//!                          "dimensions": 256, "encoding_format": "float" | "base64",
+//!                          "prefix": "search_query: "}
 //!   GET  /v1/models
 //!   GET  /health
 //!
@@ -14,6 +15,7 @@
 
 use std::sync::Arc;
 
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -38,6 +40,10 @@ pub struct AppState {
 enum Input {
     One(String),
     Many(Vec<String>),
+    /// OpenAI also allows pre-tokenized input. We parse it only to reject it
+    /// clearly: tiktoken ids mean nothing to this model's vocabulary.
+    Tokens(Vec<u32>),
+    TokenBatches(Vec<Vec<u32>>),
 }
 
 #[derive(Deserialize)]
@@ -59,7 +65,24 @@ struct EmbeddingsRequest {
 struct EmbeddingObject {
     object: &'static str,
     index: usize,
-    embedding: Vec<f32>,
+    embedding: Embedding,
+}
+
+/// `untagged` makes serde write the inner value directly: a JSON array of
+/// numbers for Float, a JSON string for Base64.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum Embedding {
+    Float(Vec<f32>),
+    Base64(String),
+}
+
+/// OpenAI's base64 format: the vector's raw little-endian f32 bytes, base64'd.
+/// The OpenAI Python SDK asks for this by default and decodes it with
+/// numpy.frombuffer(..., dtype="<f4"), so this is not optional.
+fn to_base64(v: &[f32]) -> String {
+    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+    B64.encode(bytes)
 }
 
 #[derive(Serialize)]
@@ -90,9 +113,23 @@ async fn embeddings(State(st): State<Arc<AppState>>, Json(req): Json<EmbeddingsR
     let texts = match req.input {
         Input::One(s) => vec![s],
         Input::Many(v) => v,
+        Input::Tokens(_) | Input::TokenBatches(_) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "TOKEN_INPUT_UNSUPPORTED",
+                "send text, not token ids (LangChain: OpenAIEmbeddings(..., check_embedding_ctx_length=False))",
+            )
+        }
     };
     if texts.is_empty() {
         return err(StatusCode::BAD_REQUEST, "EMPTY_INPUT", "'input' must be a non-empty string or array");
+    }
+    if let Some(i) = texts.iter().position(|t| t.is_empty()) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "EMPTY_STRING",
+            format!("input[{i}] is an empty string; an empty input has no meaningful embedding"),
+        );
     }
     if texts.len() > st.max_inputs {
         return err(
@@ -106,11 +143,11 @@ async fn embeddings(State(st): State<Arc<AppState>>, Json(req): Json<EmbeddingsR
             return err(StatusCode::NOT_FOUND, "MODEL_NOT_FOUND", format!("this server serves '{}', not '{m}'", st.embedder.spec.name));
         }
     }
-    if let Some(f) = &req.encoding_format {
-        if f != "float" {
-            return err(StatusCode::BAD_REQUEST, "UNSUPPORTED_ENCODING", "only encoding_format=float is supported");
-        }
-    }
+    let base64 = match req.encoding_format.as_deref() {
+        None | Some("float") => false,
+        Some("base64") => true,
+        Some(other) => return err(StatusCode::BAD_REQUEST, "UNSUPPORTED_ENCODING", format!("encoding_format '{other}': use float or base64")),
+    };
 
     let _permit = match st.gate.acquire().await {
         Ok(p) => p,
@@ -127,7 +164,11 @@ async fn embeddings(State(st): State<Arc<AppState>>, Json(req): Json<EmbeddingsR
                 .vectors
                 .into_iter()
                 .enumerate()
-                .map(|(index, embedding)| EmbeddingObject { object: "embedding", index, embedding })
+                .map(|(index, v)| EmbeddingObject {
+                    object: "embedding",
+                    index,
+                    embedding: if base64 { Embedding::Base64(to_base64(&v)) } else { Embedding::Float(v) },
+                })
                 .collect();
             Json(EmbeddingsResponse {
                 object: "list",

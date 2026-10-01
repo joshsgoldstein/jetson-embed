@@ -7,8 +7,8 @@ use candle_core::{DType, Device, Tensor};
 use tokenizers::Tokenizer;
 
 use crate::backbones::{self, Encoder};
-use crate::pooling::{l2_normalize, pool, truncate_dims};
-use crate::registry::ModelSpec;
+use crate::pooling::{int8_tanh, l2_normalize, pool, truncate_dims};
+use crate::registry::{ModelSpec, PostStage};
 use crate::settings::ModelArgs;
 
 pub struct Embedder {
@@ -93,23 +93,26 @@ impl Embedder {
             .into_iter()
             .enumerate()
             .map(|(i, e)| {
-                let mut ids = e.get_ids().to_vec();
-                let mut types = e.get_type_ids().to_vec();
-                if ids.is_empty() {
-                    // "" tokenizes to nothing for decoder tokenizers; give the
-                    // model one token to attend to rather than an empty tensor.
-                    ids.push(self.pad_id);
-                    types.push(0);
-                }
-                (i, ids, types)
+(i, e.get_ids().to_vec(), e.get_type_ids().to_vec())
             })
             .collect();
         let prompt_tokens: usize = items.iter().map(|(_, ids, _)| ids.len()).sum();
 
+        // Zero tokens means nothing to compute (decoder tokenizers turn "" into
+        // zero tokens). Answer with the zero vector -- what sentence-transformers
+        // returns -- without running the model, and keep it out of the batches.
+        let width = dims.map_or(self.encoder.hidden_size(), |d| d.min(self.encoder.hidden_size()));
+        let mut vectors: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+        items.retain(|(i, ids, _)| {
+            if ids.is_empty() {
+                vectors[*i] = Some(vec![0.0; width]);
+            }
+            !ids.is_empty()
+        });
+
         // 2. Sort longest-first so each batch pads as little as possible, then
         //    cut batches where (count x longest) would exceed max_batch_tokens.
         items.sort_by_key(|(_, ids, _)| std::cmp::Reverse(ids.len()));
-        let mut vectors: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
         let mut start = 0;
         while start < items.len() {
             let longest = items[start].1.len();
@@ -146,8 +149,13 @@ impl Embedder {
         let token_type_ids = Tensor::from_vec(types, (b, l), &self.device)?;
 
         let hidden = self.encoder.encode(&input_ids, &attention_mask, &token_type_ids)?;
-        let pooled = pool(self.spec.pooling, &hidden, &attention_mask)?;
-        let mut vec = l2_normalize(&pooled.to_dtype(DType::F32)?)?;
+        let mut pooled = pool(self.spec.pooling, &hidden, &attention_mask)?.to_dtype(DType::F32)?;
+        for stage in &self.spec.post {
+            pooled = match stage {
+                PostStage::Int8Tanh => int8_tanh(&pooled)?,
+            };
+        }
+        let mut vec = l2_normalize(&pooled)?;
         if let Some(d) = dims {
             vec = truncate_dims(&vec, d)?;
         }

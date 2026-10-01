@@ -103,6 +103,13 @@ pub fn last_token_pool(hidden: &Tensor, mask: &Tensor) -> Result<Tensor> {
     hidden.gather(&idx, 1)?.squeeze(1)
 }
 
+/// pplx-embed's int8 stage: squash with tanh, scale to the int8 range, round.
+/// The result is still f32 (whole numbers in [-127, 127]); l2_normalize then
+/// rescales it, which is exactly what sentence-transformers does.
+pub fn int8_tanh(x: &Tensor) -> Result<Tensor> {
+    (x.tanh()? * 127.0)?.round()?.clamp(-128.0, 127.0)
+}
+
 /// Scale each row to unit length so that dot product == cosine similarity.
 /// Every model here ships with `normalize_embeddings=True` semantics.
 pub fn l2_normalize(x: &Tensor) -> Result<Tensor> {

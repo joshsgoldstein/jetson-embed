@@ -2,10 +2,11 @@
 //! backbone to build, how to pool, how long inputs may be, and which prefix
 //! the model expects. Nothing here touches tensors; it only reads JSON.
 //!
-//! The Hub gives us three sources of truth, and we read all three:
+//! The Hub gives us four sources of truth, and we read all four:
 //!   config.json                    -> architecture + hyper-parameters
 //!   1_Pooling/config.json          -> pooling mode (sentence-transformers)
 //!   sentence_bert_config.json      -> max_seq_length the authors trained for
+//!   modules.json                   -> the stages after pooling (quantize, ...)
 //! See docs/02-model-registry.md.
 
 use anyhow::{bail, Context, Result};
@@ -49,6 +50,40 @@ impl Backbone {
     }
 }
 
+/// A stage sentence-transformers runs after pooling, read from modules.json.
+/// Skipping one does not crash -- it silently returns different vectors, which
+/// is why an unknown stage is an error rather than a warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostStage {
+    /// pplx-embed's FlexibleQuantizer (default mode): round(tanh(x) * 127).
+    Int8Tanh,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModuleEntry {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+/// Map modules.json to post-pooling stages. Transformer and Pooling are the
+/// backbone and pooler we already build; Normalize is always applied last.
+fn post_stages(dir: &Path) -> Result<Vec<PostStage>> {
+    let path = dir.join("modules.json");
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let modules: Vec<ModuleEntry> = read_json(&path)?;
+    let mut stages = vec![];
+    for m in modules {
+        match m.kind.rsplit('.').next().unwrap_or(&m.kind) {
+            "Transformer" | "Pooling" | "Normalize" => {}
+            "FlexibleQuantizer" => stages.push(PostStage::Int8Tanh),
+            other => bail!("modules.json stage '{other}' is not supported; its output would be silently wrong"),
+        }
+    }
+    Ok(stages)
+}
+
 /// Just enough of config.json to route. The backbone parses the full config itself.
 #[derive(Debug, Deserialize)]
 struct RoutingConfig {
@@ -77,6 +112,8 @@ pub struct ModelSpec {
     pub dir: PathBuf,
     pub backbone: Backbone,
     pub pooling: Pooling,
+    /// Stages between pooling and normalization, in order.
+    pub post: Vec<PostStage>,
     /// Longest input in tokens. Inputs are truncated to this.
     pub max_seq_len: usize,
     /// The string the tokenizer pads with ("[PAD]", "<pad>", "<|endoftext|>").
@@ -112,6 +149,8 @@ impl ModelSpec {
             guess
         };
 
+        let post = post_stages(dir)?;
+
         // Max length: what the authors trained at beats what the architecture allows.
         let sbert: SentenceBertConfig = read_json(&dir.join("sentence_bert_config.json")).unwrap_or_default();
         let arch_max = cfg.max_position_embeddings.or(cfg.n_positions).unwrap_or(512);
@@ -130,7 +169,7 @@ impl ModelSpec {
             bail!(
                 "{} not found. This loader reads safetensors only. Convert a pytorch_model.bin with:\n  \
                  python -c \"from safetensors.torch import save_file; import torch; \
-                 save_file({{k: v.contiguous() for k, v in torch.load('pytorch_model.bin').items()}}, 'model.safetensors')\"",
+                 save_file({{k: v.contiguous() for k, v in torch.load('pytorch_model.bin', weights_only=True).items()}}, 'model.safetensors')\"",
                 weights_path.display()
             );
         }
@@ -143,7 +182,7 @@ impl ModelSpec {
             dir.file_name().map(|s| s.to_string_lossy().replace("__", "/")).unwrap_or_else(|| "model".into())
         });
 
-        Ok(Self { name, dir: dir.to_path_buf(), backbone, pooling, max_seq_len, pad_token, config_path, tokenizer_path, weights_path })
+        Ok(Self { name, dir: dir.to_path_buf(), backbone, pooling, post, max_seq_len, pad_token, config_path, tokenizer_path, weights_path })
     }
 }
 
